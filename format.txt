@@ -1,0 +1,15 @@
+<think>让LLM对题目进行分析，给出需要的法条</think>
+<search>法条</search>  # 这里用LLM给出的法条作为query来检索法条，以避免幻觉
+<information>法条1,2,3。。。</information> # 检索器返回的法条列表
+<think>这里应该对检索器返回的法条进行分析，对每条法条给出适用或者不适用的原因，然后再进行推理给出答案</think>
+<information>筛选之后的法条</information>
+<answer>BC</answer>
+
+<think>分析之前不对的原因</think>
+<search>模型新给出的法条</search>
+<information>检索器按模型新给出的法条返回的4,5,6。。。</information>
+<think>这里应该对检索器返回的法条进行分析，对每条法条给出适用或者不适用的原因，然后再进行推理给出答案</think>
+<information>筛选之后的法条</information>
+<answer>BC</answer>
+...
+<answer>BC<answer>

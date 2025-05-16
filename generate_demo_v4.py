@@ -1,0 +1,403 @@
+# v4 update: 
+# 2025.5.14
+# 0. 换检索模型/home/lkc/research/law_o1/longcot_and_rag/retrieve_api_search_r1_bm25.py
+# 1. result json格式剥离
+# 2. 检索回来法条，对适用/不适用原因分析
+# 3. revise多轮的记录都要保留 （保留在previous_all里面了）
+# 4. retrieve取top1
+
+# 流程图参考pipeline.jpg（
+
+# demo见output/all_results.json,（output/demo.txt也存了COT和revised_COT，有换行方便看）
+# TODO:reviseCOT分别试了用r1和v3模型，好像v3模型效果更好（？）
+# 其中COT是每一轮的直接合并，每一轮都包含格式如下
+# <think>让LLM对题目进行分析，给出需要的法条</think>
+# <search>法条</search>  # 这里用LLM给出的法条作为query来检索法条，以避免幻觉
+# <information>法条1,2,3。。。</information> # 检索器返回的法条列表
+# <think>这里应该对检索器返回的法条进行分析，对每条法条给出适用或者不适用的原因，然后再进行推理给出答案</think>
+# <information>筛选之后的法条</information>
+# <answer>BC</answer>
+# revised_COT是修正之后的答案,但是目测质量不太好，可能需要prompt调整
+
+import os
+# 通过 pip install volcengine-python-sdk[ark] 安装方舟SDK
+from volcenginesdkarkruntime import Ark
+import json
+import re
+import requests
+
+api_key = "53e3f259-037d-412d-98ea-0b4c5b45d5a4"
+modelv3 = "deepseek-v3-250324"
+modelr1 = "deepseek-r1-250120"
+
+# 初始化Ark客户端
+client = Ark(api_key = api_key)
+
+test_question="王某系某国家机关工作人员，被群众举报收受他人贿赂，市纪委对其立案查处，查出王某在建设本单位办公楼的过程中，收受工程施工方的贿赂计人民币3000元。在市纪委找其谈话过程中，\
+        王某主动交代了另4起收受他人贿赂计人民币9万的事实。下列说法正确的有哪些?"+' "A": "王某构成受贿罪自首，应当从轻或者减轻处罚",\
+        "B": "王某的行为不构成自首，属于坦白，可以酌情从轻处罚",\
+        "C": "王某的行为属于坦白，应当从轻处罚",\
+        "D": "王某的行为成立受贿罪自首，可以从轻或者减轻处罚" '
+
+def get_response(model, system_prompt, user_prompt):
+    # 创建一个对话请求
+    completion = client.chat.completions.create(
+        model = model,
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    )
+    response = completion.choices[0].message.content
+    return response
+
+# initial round: 
+# input question, output reasoning process and law query
+def init_query(question=test_question):
+    # 用他背的法条当做query
+    ini_prompt='你是一名法学专家。你非常擅长阅读法律案例与回忆相关的法条。\
+        请你阅读一道司法考试题目和它的选项，认真阅读每一个选项，有逻辑地思考。\
+        你需要给出分析题目所有可能需要参考的法条。'
+
+    format_request="""你的输出格式必须严格按照以下的样例json输出格式\
+    ```json
+    {{
+        "思考过程": "...",
+        "法条1": "《中华人民共和国民法典》第xxx条：xxx",
+        "法条2": "《中华人民共和国刑法》第xxx条：xxx",
+        "法条3": "《xx法》第xxx条：xxx",
+        ...
+    }}
+    ```"""
+    response = get_response(modelv3, ini_prompt + format_request, "<需要解决的问题>"+question+"</需要解决的问题>" )
+    
+    json_start = response.find('```json')
+    json_end = response.find('```', json_start + 7)
+        
+    if json_start != -1 and json_end != -1:
+        json_str = response[json_start + 7:json_end].strip()
+        response_json = json.loads(json_str)
+    else:
+        # Try to parse the whole response
+        response_json = json.loads(response)
+    
+    # Extract the reasoning process
+    reasoning_process = response_json.get("思考过程", "")
+    # Extract all law articles (not just 3)
+    queries = []
+    for key, value in response_json.items():
+        if key.startswith("法条") and value:
+            queries.append(value)
+    if not queries:
+        queries = [question]
+    # print("思考过程:", reasoning_process)
+    # print("检索法条:", queries)
+    return reasoning_process, queries
+
+# retrieve: use queries to retrieve law articles
+# input: queries
+# output: law articles
+def retrieve(queries):
+    # API 服务的地址（确保 Flask 或 FastAPI 服务已在 localhost 上运行）
+    api_url = "http://localhost:5000/retrieve"
+
+    # 请求体，包含查询文本和返回结果的数量
+    data = {
+        "queries": queries,
+        "top_k": 1
+    }
+
+    # 发送 POST 请求到 API
+    response = requests.post(api_url, json=data)
+
+    # 解析返回的 JSON 响应
+    if response.status_code == 200:
+        result = response.json()
+        # print("Retrieved articles:")
+        # print(json.dumps(result, indent=4, ensure_ascii=False))
+    else:
+        print(f"Error: {response.status_code}")
+        # print(response.text)
+    
+    formatted_result = [
+        entry[0]["document"]["contents"]  # Access first item in sublist -> "document" -> "contents"
+        for entry in result["result"]       # Iterate through each entry in "result" list
+    ]
+    # Return the formatted list of law article contents
+    # print("Formatted result:")
+    # print(json.dumps(formatted_result, indent=4, ensure_ascii=False))
+    return formatted_result
+
+# judge whether the law articles are applicable, and give the reason, and give answer
+# input: law articles, question
+# output: reasoning process, filtered law articles, answer
+def judge_and_answer(result, question=test_question):
+    # 将检索到的法条转换为字符串格式
+    result_str = json.dumps(result, ensure_ascii=False)
+
+    # judge_answer_prompt='你是一名法学专家。你非常擅长阅读法律案例，并判断有关这个案例的表述是否正确。请你阅读一道司法考试题目和它的选项，充分发挥你的能力，认真阅读每一个选项，有逻辑地思考。\
+    # 你会看到一些相关的法条，排除对你没有帮助的法条，只参考你认为对你分析这道题有帮助的法条。你需要在“思考过程”中说明为什么参考或者不参考某条法条。 \
+    # 你需要对每一个选项，详细地解释，联系题目，进行相应的分析。然后在“参考法条”中准确地给出你参考的法条内容你需要在回答的最后根据你对题目和每一个选项的分析，给出你的答案。注意：这是不定项选择题，你的最终答案必须是大写字母的组合。'
+    judge_answer_prompt='你是一名法学专家。你非常擅长阅读法律案例，并判断有关这个案例的表述是否正确。请你阅读一道司法考试题目和它的选项，充分发挥你的能力，认真阅读每一个选项，有逻辑地思考。\
+    你会看到一些相关的法条，排除对你没有帮助的法条，只参考你认为对你分析这道题有帮助的法条。你需要在“思考过程”中分析题目，说明为什么参考或者不参考某条法条。 \
+    在“参考法条”中准确地给出且只给出你参考的法条内容。你需要在回答的最后根据你对题目和每一个选项的分析，给出你的答案。注意：这是不定项选择题，你的最终答案必须是大写字母的组合。'
+
+    answer_format_prompt="""你的输出格式必须严格按照以下的json输出格式,\
+    ```json
+    {{
+        "思考过程": "...",
+        "参考法条": {{
+            "法条1": "《xx法》第xxx条：xxx",
+            "法条2": "《xx法》第xxx条：xxx",
+            ...
+        }},
+        "最终答案": "...",
+    }}
+    ```
+    """
+
+    response = get_response(modelv3, judge_answer_prompt + answer_format_prompt, "<需要解决的问题>"+question+"</需要解决的问题>"+"<可以参考的法条>"+result_str+"</可以参考的法条>" )
+    
+    json_start = response.find('```json')
+    json_end = response.find('```', json_start + 7)
+        
+    if json_start != -1 and json_end != -1:
+        json_str = response[json_start + 7:json_end].strip()
+        response_json = json.loads(json_str)
+    else:
+        # Try to parse the whole response
+        response_json = json.loads(response)
+    
+    # Extract the reasoning process
+    reasoning_process = response_json.get("思考过程", "")
+    # Extract all law articles (not just 3)
+    queries = response_json.get("参考法条", {})
+    # Extract the final answer
+    answer = response_json.get("最终答案", "")
+    # print("思考过程:", reasoning_process)
+    # print("参考法条:", queries)
+    # print("最终答案:", answer)
+    return reasoning_process, queries, answer
+
+# verify if the answer match the ground truth
+def verify_answer(answer, ground_truth='D'):
+    answer_pattern = re.compile(r'[A-D]+')  # Match one or more capital letters A-D
+    match = answer_pattern.search(answer)
+    if match:
+        answer = match.group(0)  # Get the matched letter(s)
+    if answer == ground_truth:
+        print("答案正确")
+        return True
+    else:
+        print("答案错误")
+        return False
+
+# revise: analyze law wrong or reasoning wrong, law wrong get new law
+# then continue reasoning based on all previous thing
+# then goto verify
+# input: previous thing, question
+def revise(previous_all, question=test_question):
+    revise_prompt='你是一名法学专家。你非常擅长阅读法律案例，并判断有关这个案例的表述是否正确。请你阅读一道司法考试题目和它的选项，充分发挥你的能力，认真阅读每一个选项，有逻辑地思考。\
+        下面是你之前的回答，你的最终答案是不正确的。不要重复你之前的错误。\
+        你需要根据你之前的回答，重新分析，判断你之前使用的法条是否正确且足够支撑你的分析。\
+        如果你认为不需要检索新的法条，在你之前的推理基础上继续思考，给出新的答案。你需要在回答的最后根据你对题目和每一个选项的分析，给出你的答案。注意：这是不定项选择题，你的最终答案必须是大写字母的组合。\
+        如果你认为需要检索新的法条，给出新的检索问题。\
+        '
+    
+    revise_format_prompt="""你的输出格式必须严格按照以下的两种json输出格式之一\
+    如果你认为不需要检索新的法条：```json
+    {{
+        "思考过程": "...",
+        "参考法条": {{
+            "法条1": "《xx法》第xxx条：xxx",
+            "法条2": "《xx法》第xxx条：xxx",
+            ...
+        }},
+        "最终答案": "...",
+    }}
+    ```
+    如果你认为需要检索新的法条：```json
+    {{
+        "思考过程": "...",
+        "法条1": "《中华人民共和国民法典》第xxx条：xxx",
+        "法条2": "《中华人民共和国刑法》第xxx条：xxx",
+        "法条3": "《xx法》第xxx条：xxx",
+        }}
+    ```
+    """  
+    response = get_response(modelr1, revise_prompt + revise_format_prompt, \
+        "<需要解决的问题>"+question+"</需要解决的问题>" \
+        + "之前的回答"+json.dumps(previous_all, ensure_ascii=False)+"</之前的回答>" )
+    # print("修正后的回答:", response)
+
+    json_start = response.find('```json')
+    json_end = response.find('```', json_start + 7)
+        
+    if json_start != -1 and json_end != -1:
+        json_str = response[json_start + 7:json_end].strip()
+        response_json = json.loads(json_str)
+    else:
+        # Try to parse the whole response
+        response_json = json.loads(response)
+    
+    # Extract the reasoning process
+    reasoning_process = response_json.get("思考过程", "")
+
+    # 解析返回的 JSON 响应
+    if '"最终答案":' in response:
+        answer = response_json.get("最终答案", "")
+        # print("思考过程:", reasoning_process)
+        # print("查询请求:", last_query)
+        # print("检索法条:", last_result)
+        # print("筛选思考:", last_judge_thinking)
+        # print("筛选法条:", last_filtered_law)
+        # print("最终答案:", answer)
+        newCOT ='<think>'+reasoning_process +'</think>'+'\n'+ \
+                '<answer>'+ answer+'</answer>'
+        return newCOT, answer
+    else: 
+        # 重新检索法条
+        # Extract all law articles (not just 3)
+        queries = []
+        for key, value in response_json.items():
+            if key.startswith("法条") and value:
+                queries.append(value)
+        if not queries:
+            queries = [question]
+        
+        result = retrieve(queries)
+        judge_thinking, filtered_law, answer = judge_and_answer(result, question)
+        # print("思考过程:", reasoning_process)
+        # print("查询请求:", queries)
+        # print("检索法条:", result)
+        # print("筛选思考:", judge_thinking)
+        # print("筛选法条:", filtered_law)
+        # print("最终答案:", answer)
+        newCOT ='<think>'+reasoning_process +'</think>'+'\n'+ \
+                        '<search>'+json.dumps(queries, ensure_ascii=False) +'</search>'+'\n'+\
+                        '<information>'+ json.dumps(result, ensure_ascii=False) +'</information>'+'\n'+\
+                        '<think>'+ judge_thinking +'</think>'+'\n'+\
+                        '<information>'+ json.dumps(filtered_law, ensure_ascii=False) +'</information>'+'\n'+\
+                        '<answer>'+ answer+'</answer>'
+        return newCOT, answer
+
+def save_answer(previous_all, ground_truth):
+    # 用deepseek r1模型整合COT，保存答案
+    save_answer_prompt='你是一名法学专家。你非常擅长阅读法律案例，并判断有关这个案例的表述是否正确。\
+        下面是你之前的回答，你的最终答案是正确的。请确保你本次推理出的答案与之前的一致。\
+        你需要根据你之前的回答，进行分析，整理你的思维过程，合并为如下格式的连贯回答。\
+        '
+    save_answer_format_prompt="""你的输出格式必须严格按照以下的json输出格式\
+    <think>reasoning</think>
+    <search>this is a query</search>
+    <information>法条1,2,3。。。</information>
+    <think>reasoning</think>
+    <search>this is a query</search>
+    <information>法条1,2,3。。。</information>
+    ...
+    <answer>BC<answer>"""
+    
+    response = get_response(modelv3, save_answer_prompt + save_answer_format_prompt, \
+        "<之前的推理>"+json.dumps(previous_all, ensure_ascii=False)+"</之前的推理>"+"<正确答案>"+ground_truth+"</正确答案>" )
+    print("保存的答案:", response)
+    return response
+ 
+if __name__ == "__main__":
+    # Read questions and answers from JSON file
+    data_file_path = "data/demo.json"
+    
+    try:
+        with open(data_file_path, "r", encoding="utf-8") as f:
+            questions = json.load(f)
+        print(f"Successfully loaded {len(questions)} questions from {data_file_path}")
+    except Exception as e:
+        print(f"Error loading JSON file: {e}")
+        questions = []
+    
+    # Create a list to store all results
+    all_results = []
+    
+        # Process each question from the JSON file
+    for item in questions:
+            question_id = item.get("id", "unknown")
+            statement = item["statement"]
+            options = item["option_list"]
+            ground_truth = item["answer"]  # This is a list like ["D"] or ["A", "B", "C", "D"]
+            
+            # Format question with options
+            formatted_question = statement + '\n'
+            for key, value in options.items():
+                formatted_question += f'{key}: {value}\n'
+                
+            print(f"\n\nProcessing question ID: {question_id}")
+            print(f"Question: {formatted_question}")
+            print(f"Ground truth: {ground_truth}")
+            
+            # Run the pipeline
+            thinking1, queries = init_query(formatted_question)
+            result = retrieve(queries)
+            thinking2, filtered_law, answer = judge_and_answer(result, formatted_question)
+            
+            # Verify answer against ground truth
+            ground_truth_str = ''.join(sorted(ground_truth))  # Convert list to sorted string
+            flag = verify_answer(answer, ground_truth_str)
+            previous_all = '<think>'+thinking1 +'</think>'+'\n'+ \
+                '<search>'+json.dumps(queries, ensure_ascii=False) +'</search>'+'\n'+\
+                '<information>'+ json.dumps(result, ensure_ascii=False) +'</information>'+'\n'+\
+                '<think>'+ thinking2 +'</think>'+'\n'+\
+                '<information>'+ json.dumps(filtered_law, ensure_ascii=False) +'</information>'+'\n'+\
+                '<answer>'+ answer+'</answer>'
+            
+            # Try to improve if needed
+            max_iterations = 3
+            for i in range(max_iterations):
+                print(f"Iteration {i+1}")
+                if flag:
+                    print("COT:", previous_all)
+                    # Answer is correct, save it
+                    final_response = save_answer(previous_all, ground_truth_str)
+                    
+                    # Add to results list instead of saving individually
+                    all_results.append({
+                        "question_id": question_id,
+                        "question": statement,
+                        "options": options,
+                        "ground_truth": ground_truth,
+                        "COT": previous_all,
+                        "revised_COT": final_response,
+                        "success": True
+                    })
+                    
+                    break
+                else:
+                    # Revise the answer
+                    newCOT, answer = revise(previous_all,formatted_question)                   
+                    previous_all += '\n' + newCOT
+                    flag = verify_answer(answer, ground_truth_str)
+                    
+                # If we've reached max iterations and still incorrect
+                if i == max_iterations - 1 and not flag:
+                    print(f"Failed to get correct answer for question {question_id} after {max_iterations} iterations")
+                    print("COT:", previous_all)
+                    # Add the best result we have so far
+                    all_results.append({
+                        "question_id": question_id,
+                        "question": statement,
+                        "options": options,
+                        "ground_truth": ground_truth,
+                        "COT": previous_all,
+                        "revised_COT": None,
+                        "success": False
+                    })
+    
+    # Save all results to a single JSON file
+    output_dir = "output"
+    os.makedirs(output_dir, exist_ok=True)
+    output_file = os.path.join(output_dir, "all_results.json")
+    
+    try:
+        with open(output_file, "w", encoding="utf-8") as f:
+            json.dump(all_results, f, ensure_ascii=False, indent=2)
+        print(f"All results saved to {output_file}")
+    except Exception as e:
+        print(f"Error saving results: {e}")

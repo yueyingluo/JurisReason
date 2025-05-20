@@ -1,23 +1,11 @@
-# v4 update:
-# 2025.5.14
-# 0. 换检索模型/home/lkc/research/law_o1/longcot_and_rag/retrieve_api_search_r1_bm25.py
-# 1. result json格式剥离
-# 2. 检索回来法条，对适用/不适用原因分析
-# 3. revise多轮的记录都要保留 （保留在previous_all里面了）
-# 4. retrieve取top1
+# v4.2 update:
+# 2025.5.20
+# 0. 给save_answer也拆成sys_prompt和user_prompt了
+# 1. debug了4.1中revise函数改了json格式但是reasoning_process的json.get里面的内容没改的问题
 
 # 流程图参考pipeline.jpg（
 
-# demo见output/all_results.json,（output/demo.txt也存了COT和revised_COT，有换行方便看）
-# TODO:reviseCOT分别试了用r1和v3模型，好像v3模型效果更好（？）
-# 其中COT是每一轮的直接合并，每一轮都包含格式如下
-# <think>让LLM对题目进行分析，给出需要的法条</think>
-# <search>法条</search>  # 这里用LLM给出的法条作为query来检索法条，以避免幻觉
-# <information>法条1,2,3。。。</information> # 检索器返回的法条列表
-# <think>这里应该对检索器返回的法条进行分析，对每条法条给出适用或者不适用的原因，然后再进行推理给出答案</think>
-# <information>筛选之后的法条</information>
-# <answer>BC</answer>
-# revised_COT是修正之后的答案,但是目测质量不太好，可能需要prompt调整
+# demo见output/all_results.json
 
 import os
 # 通过 pip install volcengine-python-sdk[ark] 安装方舟SDK
@@ -188,13 +176,13 @@ def judge_and_answer(result, question=test_question):
     # reasoning_process = response_json.get("思考过程", "")
     reasoning_process = {k:v for k,v in response_json.items() if k!='最终答案'}
     # Extract all law articles (not just 3)
-    queries = response_json.get("参考法条", {})
+    # queries = response_json.get("参考法条", {})
     # Extract the final answer
     answer = response_json.get("最终答案", "")
     # print("思考过程:", reasoning_process)
     # print("参考法条:", queries)
     # print("最终答案:", answer)
-    return reasoning_process, queries, answer
+    return reasoning_process, answer
 
 # verify if the answer match the ground truth
 
@@ -263,11 +251,10 @@ def revise(previous_all, question=test_question):
         # Try to parse the whole response
         response_json = json.loads(response)
 
-    # Extract the reasoning process
-    reasoning_process = response_json.get("思考过程", "")
 
     # 解析返回的 JSON 响应
     if '"最终答案":' in response:
+        reasoning_process = {k:v for k,v in response_json.items() if k!='最终答案'}
         answer = response_json.get("最终答案", "")
         # print("思考过程:", reasoning_process)
         # print("查询请求:", last_query)
@@ -275,11 +262,12 @@ def revise(previous_all, question=test_question):
         # print("筛选思考:", last_judge_thinking)
         # print("筛选法条:", last_filtered_law)
         # print("最终答案:", answer)
-        newCOT = '<think>'+reasoning_process + '</think>'+'\n' + \
+        newCOT = '<think>'+json.dumps(reasoning_process, ensure_ascii=False) + '</think>'+'\n' + \
             '<answer>' + answer+'</answer>'
         return newCOT, answer
     else:
         # 重新检索法条
+        reasoning_process = response_json.get("分析之前的法条", "")
         # Extract all law articles (not just 3)
         queries = []
         for key, value in response_json.items():
@@ -289,7 +277,7 @@ def revise(previous_all, question=test_question):
             queries = [question]
 
         result = retrieve(queries)
-        judge_thinking, filtered_law, answer = judge_and_answer(
+        judge_thinking, answer = judge_and_answer(
             result, question)
         # print("思考过程:", reasoning_process)
         # print("查询请求:", queries)
@@ -301,15 +289,14 @@ def revise(previous_all, question=test_question):
             '<search>'+json.dumps(queries, ensure_ascii=False) + '</search>'+'\n' +\
             '<information>' + json.dumps(result, ensure_ascii=False) + '</information>'+'\n' +\
             '<think>' + judge_thinking + '</think>'+'\n' +\
-            '<information>' + json.dumps(filtered_law, ensure_ascii=False) + '</information>'+'\n' +\
             '<answer>' + answer+'</answer>'
         return newCOT, answer
 
 
 def save_answer(previous_all, ground_truth):
     # 用deepseek r1模型整合COT，保存答案
-    save_answer_prompt = '你是一名法学专家。你非常擅长阅读法律案例，并判断有关这个案例的表述是否正确。\
-        下面是你之前的回答，你的最终答案是正确的。请确保你本次推理出的答案与之前的一致。\
+    sys_prompt = '你是一名法学专家。'
+    save_answer_prompt = '下面是你之前的回答，你的最终答案是正确的。请确保你本次推理出的答案与之前的一致。\
         你需要根据你之前的回答，进行分析，整理你的思维过程，合并为如下格式的连贯回答。\
         '
     save_answer_format_prompt = """你的输出格式必须严格按照以下的json输出格式\
@@ -322,7 +309,7 @@ def save_answer(previous_all, ground_truth):
     ...
     <answer>BC<answer>"""
 
-    response = get_response(modelv3, save_answer_prompt + save_answer_format_prompt,
+    response = get_response(modelv3, sys_prompt+save_answer_prompt, save_answer_format_prompt+\
                             "<之前的推理>"+json.dumps(previous_all, ensure_ascii=False)+"</之前的推理>"+"<正确答案>"+ground_truth+"</正确答案>")
     print("保存的答案:", response)
     return response
@@ -364,7 +351,7 @@ if __name__ == "__main__":
         # Run the pipeline
         thinking1, queries = init_query(formatted_question)
         result = retrieve(queries)
-        thinking2, filtered_law, answer = judge_and_answer(
+        thinking2, answer = judge_and_answer(
             result, formatted_question)
 
         def json_to_string(json_obj):
@@ -383,7 +370,6 @@ if __name__ == "__main__":
             '<search>'+json.dumps(queries, ensure_ascii=False) + '</search>'+'\n' +\
             '<information>' + json.dumps(result, ensure_ascii=False) + '</information>'+'\n' +\
             '<think>' + thinking2 + '</think>'+'\n' +\
-            '<information>' + json.dumps(filtered_law, ensure_ascii=False) + '</information>'+'\n' +\
             '<answer>' + answer+'</answer>'
 
         # Try to improve if needed

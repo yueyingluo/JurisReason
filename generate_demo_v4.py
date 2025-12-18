@@ -14,7 +14,7 @@ import json
 import re
 import requests
 
-api_key = "53e3f259-037d-412d-98ea-0b4c5b45d5a4"
+api_key = # please load from your config 
 modelv3 = "deepseek-v3-250324"
 modelr1 = "deepseek-r1-250120"
 
